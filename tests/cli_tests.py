@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from multiprocessing import get_all_start_methods
 from os import path
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1314,3 +1315,219 @@ def test_explore_crawls_seeds_without_links(tmp_path, list_mode):
         args.blacklist = cli_utils.load_blacklist(args.blacklist)
         assert cli_utils.cli_discovery(args) == 0
     assert sorted(crawled) == ["https://blocked.org/", "https://nolinks.org/"]
+
+
+# --------------------------------------------------------------------------- #
+# resumable --sitemap --list with checkpoints
+# --------------------------------------------------------------------------- #
+
+
+def _checkpoint_graph():
+    "Index plus three nested sitemaps with overlapping page links."
+    root = "https://example.org/sitemap_index.xml"
+    nested = [f"https://example.org/sitemap-{letter}.xml" for letter in ("a", "b", "c")]
+    pages = {
+        root: "<sitemapindex>" + "".join(f"<sitemap><loc>{u}</loc></sitemap>" for u in nested) + "</sitemapindex>",
+        "https://example.org/robots.txt": f"Sitemap: {root}\n",
+        nested[
+            0
+        ]: "<urlset><url><loc>https://example.org/a1</loc></url><url><loc>https://example.org/shared</loc></url></urlset>",
+        nested[
+            1
+        ]: "<urlset><url><loc>https://example.org/b1</loc></url><url><loc>https://example.org/shared</loc></url></urlset>",
+        nested[2]: "<urlset><url><loc>https://example.org/c1</loc></url></urlset>",
+    }
+    expected = sorted(
+        {"https://example.org/a1", "https://example.org/b1", "https://example.org/c1", "https://example.org/shared"}
+    )
+    return root, nested, pages, expected
+
+
+def _patch_cli_graph(monkeypatch, pages):
+    "Route sitemap downloads at the in-memory graph and silence politeness waits."
+    from trafilatura import sitemaps as _sitemaps
+
+    monkeypatch.setattr(_sitemaps, "fetch_url", lambda url, **kwargs: pages.get(url))
+    monkeypatch.setattr(_sitemaps, "is_live_page", lambda url, config: True)
+    monkeypatch.setattr(_sitemaps, "sleep", lambda seconds: None)
+
+
+def test_sitemap_checkpoint_requires_list(run, tmp_path):
+    state = tmp_path / "state.json"
+    code, _, err = run(["--sitemap", "https://example.org/sitemap.xml", "--checkpoint", str(state)])
+    assert code == 2
+    assert "--checkpoint" in err
+
+
+def test_sitemap_budget_requires_checkpoint(run):
+    code, _, err = run(["--sitemap", "https://example.org/sitemap.xml", "--list", "--sitemap-budget", "2"])
+    assert code == 2
+    assert "--checkpoint" in err
+
+
+def test_sitemap_budget_must_be_positive(run, tmp_path):
+    state = tmp_path / "state.json"
+    code, _, err = run(
+        ["--sitemap", "https://example.org/sitemap.xml", "--list", "--checkpoint", str(state), "--sitemap-budget", "0"]
+    )
+    assert code == 2
+    assert "positive" in err
+
+
+def test_sitemap_checkpoint_rejects_input_file(run, tmp_path):
+    state = tmp_path / "state.json"
+    seeds = tmp_path / "seeds.txt"
+    seeds.write_text("https://example.org/\n")
+    code, _, err = run(["--sitemap", "-i", str(seeds), "--list", "--checkpoint", str(state)])
+    assert code == 2
+    assert "single URL" in err
+
+
+def test_sitemap_checkpoint_unwritable_directory(run, tmp_path):
+    state = tmp_path / "missing-dir" / "state.json"
+    code, _, err = run(
+        ["--sitemap", "https://example.org/sitemap.xml", "--list", "--checkpoint", str(state), "--parallel", "1"]
+    )
+    assert code == 2
+    assert "writable" in err
+
+
+def test_sitemap_checkpoint_segmented_cli(run, monkeypatch, tmp_path):
+    "Segmented CLI runs print new links per run and the full set on completion."
+    from trafilatura.checkpoint import SitemapCheckpoint
+
+    root, _nested, pages, expected = _checkpoint_graph()
+    _patch_cli_graph(monkeypatch, pages)
+    state = tmp_path / "state.json"
+    argv = ["--sitemap", root, "--list", "--checkpoint", str(state), "--sitemap-budget", "1", "--parallel", "1"]
+
+    outputs = []
+    for _ in range(6):
+        code, out, _ = run(argv)
+        outputs.append((code, out.split()))
+        if SitemapCheckpoint.load(state).completed:
+            break
+
+    codes = [code for code, _ in outputs]
+    assert codes[-1] == 0  # the completion run exports everything
+    assert 3 in codes  # budget-limited runs signal resumability
+    assert sorted(outputs[-1][1]) == expected
+    # every link is discovered at least once; the completion export is de-duplicated
+    discovered = {link for _code, links in outputs for link in links}
+    assert discovered == set(expected)
+    # nothing is printed twice within a single run
+    for _code, links in outputs:
+        assert len(links) == len(set(links))
+
+
+def test_sitemap_checkpoint_without_budget_completes_in_one_run(run, monkeypatch, tmp_path):
+    from trafilatura.checkpoint import SitemapCheckpoint
+
+    root, _nested, pages, expected = _checkpoint_graph()
+    _patch_cli_graph(monkeypatch, pages)
+    state = tmp_path / "state.json"
+    code, out, _ = run(["--sitemap", root, "--list", "--checkpoint", str(state), "--parallel", "1"])
+    assert code == 0
+    assert sorted(out.split()) == expected
+    assert SitemapCheckpoint.load(state).completed is True
+
+
+def test_sitemap_checkpoint_corrupt_state_exit_2(run, tmp_path):
+    state = tmp_path / "state.json"
+    state.write_text("{broken", encoding="utf-8")
+    code, _, err = run(
+        ["--sitemap", "https://example.org/sitemap.xml", "--list", "--checkpoint", str(state), "--parallel", "1"]
+    )
+    assert code == 2
+    assert "corrupt" in err
+    assert state.read_text(encoding="utf-8") == "{broken"
+
+
+def test_sitemap_checkpoint_policy_mismatch_exit_2(run, tmp_path):
+    from trafilatura.checkpoint import SitemapCheckpoint
+
+    state = tmp_path / "state.json"
+    SitemapCheckpoint.open(state, "https://example.org/sitemap.xml", target_lang="de").save()
+    code, _, err = run(
+        [
+            "--sitemap",
+            "https://example.org/sitemap.xml",
+            "--list",
+            "--checkpoint",
+            str(state),
+            "--target-language",
+            "en",
+            "--parallel",
+            "1",
+        ]
+    )
+    assert code == 2
+    assert "target_lang" in err
+
+
+class _LocalSitemapHandler(BaseHTTPRequestHandler):
+    "Serve the fixed graph over real loopback HTTP."
+
+    pages: ClassVar[dict[str, str]] = {}
+
+    def do_GET(self):
+        body = self.pages.get(self.path)
+        if body is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/xml")
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def log_message(self, *_args):
+        pass
+
+
+def test_sitemap_checkpoint_end_to_end_local_server(run, monkeypatch, tmp_path):
+    "A fixed local graph, segmented across CLI runs, equals one full traversal."
+    import urllib.request
+
+    from trafilatura import sitemaps as _sitemaps
+    from trafilatura.checkpoint import SitemapCheckpoint
+
+    root, _nested, pages, expected = _checkpoint_graph()
+    origin = "https://example.org"
+    # the HTTP handler keys requests by path, not by absolute URL
+    path_pages = {url.removeprefix(origin): body for url, body in pages.items()}
+    handler = type("_BoundHandler", (_LocalSitemapHandler,), {"pages": path_pages})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    local_origin = f"http://127.0.0.1:{server.server_port}"
+
+    def local_fetch(url, **kwargs):
+        # keep the public, domain-valid URLs in the state, serve them from loopback
+        local_url = url.replace(origin, local_origin)
+        try:
+            with urllib.request.urlopen(local_url, timeout=5) as response:
+                return response.read().decode()
+        except OSError:
+            return None
+
+    monkeypatch.setattr(_sitemaps, "fetch_url", local_fetch)
+    monkeypatch.setattr(_sitemaps, "is_live_page", lambda url, config: True)
+    monkeypatch.setattr(_sitemaps, "sleep", lambda seconds: None)
+    state = tmp_path / "state.json"
+    argv = ["--sitemap", root, "--list", "--checkpoint", str(state), "--sitemap-budget", "1", "--parallel", "1"]
+    try:
+        collected = set()
+        for _ in range(6):
+            code, out, err = run(argv)
+            assert code in (0, 3), err
+            collected.update(out.split())
+            if SitemapCheckpoint.load(state).completed:
+                assert code == 0
+                break
+        assert sorted(collected) == expected
+        # a completed checkpoint re-exports the full set without new requests
+        code, out, _ = run(argv)
+        assert code == 0
+        assert sorted(out.split()) == expected
+    finally:
+        server.shutdown()

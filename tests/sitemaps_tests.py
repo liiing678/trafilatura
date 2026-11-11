@@ -14,6 +14,7 @@ from courlan import get_hostinfo
 
 import trafilatura
 from trafilatura import downloads, sitemaps
+from trafilatura.checkpoint import CheckpointFormatError, CheckpointMismatchError, SitemapCheckpoint
 from trafilatura.deduplication import is_similar_domain
 from trafilatura.settings import DEFAULT_CONFIG
 from trafilatura.utils import Response, decode_file
@@ -699,3 +700,372 @@ def test_sleep_time_defaults_to_config(monkeypatch):
     with patch.object(sitemaps, "sleep") as mock_sleep:
         sitemaps.sitemap_search("https://example.org", sleep_time=0.5, config=config)
     assert mock_sleep.call_args_list == [call(0.5)]
+
+
+# --------------------------------------------------------------------------- #
+# resumable searches with checkpoints
+# --------------------------------------------------------------------------- #
+
+# a fixed local graph: one index, three nested sitemaps, overlapping page links
+GRAPH_ROOT = "https://example.org/sitemap_index.xml"
+GRAPH_NESTED = [f"https://example.org/sitemap-{letter}.xml" for letter in ("a", "b", "c")]
+GRAPH_PAGES = {
+    GRAPH_NESTED[0]: ["https://example.org/a1", "https://example.org/a2", "https://example.org/shared"],
+    GRAPH_NESTED[1]: ["https://example.org/b1", "https://example.org/shared"],
+    GRAPH_NESTED[2]: ["https://example.org/c1", "https://example.org/c2"],
+}
+GRAPH_EXPECTED = sorted({url for urls in GRAPH_PAGES.values() for url in urls})
+
+
+def _graph_pages():
+    pages = {
+        GRAPH_ROOT: (
+            "<sitemapindex>" + "".join(f"<sitemap><loc>{url}</loc></sitemap>" for url in GRAPH_NESTED) + "</sitemapindex>"
+        ),
+        "https://example.org/robots.txt": f"Sitemap: {GRAPH_ROOT}\n",
+    }
+    for sitemap_url, page_urls in GRAPH_PAGES.items():
+        pages[sitemap_url] = "<urlset>" + "".join(f"<url><loc>{page_url}</loc></url>" for page_url in page_urls) + "</urlset>"
+    return pages
+
+
+def _patch_graph(monkeypatch):
+    pages = _graph_pages()
+    requested = []
+
+    def fetch(url, **kwargs):
+        requested.append(url)
+        return pages.get(url)
+
+    monkeypatch.setattr(sitemaps, "fetch_url", fetch)
+    monkeypatch.setattr(sitemaps, "is_live_page", lambda url, config: True)
+    monkeypatch.setattr(sitemaps, "sleep", lambda seconds: None)
+    return requested
+
+
+def test_checkpoint_budget_requires_checkpoint():
+    with pytest.raises(ValueError, match="requires checkpoint_path"):
+        sitemaps.sitemap_search("https://example.org/sitemap.xml", per_run_budget=2)
+    with pytest.raises(ValueError, match="positive integer"):
+        sitemaps.sitemap_search("https://example.org/sitemap.xml", checkpoint_path="x", per_run_budget=0)
+
+
+def test_checkpoint_segmented_run_matches_one_shot(monkeypatch, tmp_path):
+    """Splitting the traversal into budgeted runs yields the same link set."""
+    requested = _patch_graph(monkeypatch)
+    state = tmp_path / "checkpoint.json"
+    kwargs = {"checkpoint_path": str(state)}
+
+    # budget counts every newly submitted sitemap, the index is the first one
+    first = sitemaps.sitemap_search(GRAPH_ROOT, per_run_budget=1, **kwargs)
+    assert first == []  # the index only lists nested sitemaps, no pages
+    checkpoint = SitemapCheckpoint.load(state)
+    assert checkpoint.completed is False
+    assert checkpoint.processed_count == 1
+    assert checkpoint.queue == GRAPH_NESTED
+    # already submitted sitemaps are not requested again
+    assert len(requested) == len(set(requested))
+
+    accumulated = set(first)
+    for _ in range(len(GRAPH_NESTED)):
+        accumulated |= set(sitemaps.sitemap_search(GRAPH_ROOT, per_run_budget=1, **kwargs))
+
+    checkpoint = SitemapCheckpoint.load(state)
+    assert checkpoint.completed is True
+    assert checkpoint.processed_count == len(GRAPH_NESTED) + 1
+    assert sorted(accumulated) == GRAPH_EXPECTED
+    # every sitemap URL was requested at most once across processes
+    assert len(requested) == len(set(requested))
+    assert set(requested) >= {GRAPH_ROOT, *GRAPH_NESTED}
+    # a completed checkpoint returns the final set without new requests
+    before = len(requested)
+    again = sitemaps.sitemap_search(GRAPH_ROOT, per_run_budget=1, **kwargs)
+    assert again == GRAPH_EXPECTED
+    assert len(requested) == before
+
+
+def test_checkpoint_unlimited_run_completes(monkeypatch, tmp_path):
+    """A checkpoint without a budget finishes in one run and marks itself complete."""
+    _patch_graph(monkeypatch)
+    state = tmp_path / "checkpoint.json"
+    result = sitemaps.sitemap_search(GRAPH_ROOT, checkpoint_path=str(state))
+    assert result == GRAPH_EXPECTED
+    assert SitemapCheckpoint.load(state).completed is True
+
+
+def test_checkpoint_state_survives_a_kill_between_sitemaps(monkeypatch, tmp_path):
+    """A process killed after the last checkpoint write resumes without re-requesting."""
+    requested = _patch_graph(monkeypatch)
+    state = tmp_path / "checkpoint.json"
+
+    sitemaps.sitemap_search(GRAPH_ROOT, checkpoint_path=str(state), per_run_budget=1)
+    first_requests = list(requested)
+    # simulate fresh processes: the module-level state is gone, only the file remains
+    for _ in range(len(GRAPH_NESTED)):
+        sitemaps.sitemap_search(GRAPH_ROOT, checkpoint_path=str(state), per_run_budget=1)
+
+    assert SitemapCheckpoint.load(state).completed is True
+    assert len(requested) == len(set(requested))
+    assert GRAPH_ROOT in first_requests
+    assert GRAPH_ROOT in requested
+
+
+def test_checkpoint_failed_fetch_is_recorded_and_not_retried(monkeypatch, tmp_path):
+    """An unreachable nested sitemap counts as processed once and is skipped on resume."""
+    pages = _graph_pages()
+    requested = []
+
+    def flaky_fetch(url, **kwargs):
+        requested.append(url)
+        if url == GRAPH_NESTED[1]:
+            return None  # download failure on sitemap-b
+        return pages.get(url)
+
+    monkeypatch.setattr(sitemaps, "fetch_url", flaky_fetch)
+    monkeypatch.setattr(sitemaps, "is_live_page", lambda url, config: True)
+    monkeypatch.setattr(sitemaps, "sleep", lambda seconds: None)
+    state = tmp_path / "checkpoint.json"
+
+    sitemaps.sitemap_search(GRAPH_ROOT, checkpoint_path=str(state), per_run_budget=2)
+    sitemaps.sitemap_search(GRAPH_ROOT, checkpoint_path=str(state), per_run_budget=2)
+
+    checkpoint = SitemapCheckpoint.load(state)
+    assert checkpoint.completed is True
+    assert GRAPH_NESTED[1] in checkpoint.seen
+    # the failed sitemap was fetched exactly once
+    assert requested.count(GRAPH_NESTED[1]) == 1
+    # links from the two reachable nested sitemaps are still complete
+    assert checkpoint.urls == sorted(set(GRAPH_PAGES[GRAPH_NESTED[0]]) | set(GRAPH_PAGES[GRAPH_NESTED[2]]))
+
+
+def test_checkpoint_gzip_nested_sitemaps(monkeypatch, tmp_path):
+    """Gzip-compressed nested sitemaps are supported across segments."""
+    nested = "https://example.org/part.xml.gz"
+    page = "https://example.org/gzip-page"
+    xml = f'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>{page}</loc></url></urlset>'
+    payloads = {
+        GRAPH_ROOT: (
+            f'<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            f"<sitemap><loc>{nested}</loc></sitemap></sitemapindex>"
+        ).encode(),
+        nested: gzip.compress(xml.encode()),
+        "https://example.org/robots.txt": f"Sitemap: {GRAPH_ROOT}\n".encode(),
+    }
+    requested = []
+
+    def send(url, no_ssl, cfg):
+        requested.append(url)
+        payload = payloads.get(url)
+        return Response(payload, 200, url) if payload is not None else None
+
+    monkeypatch.setattr(downloads, "HAS_PYCURL", False)
+    monkeypatch.setattr(downloads, "_send_urllib_request", send)
+    monkeypatch.setattr(sitemaps, "is_live_page", lambda url, config: True)
+    monkeypatch.setattr(sitemaps, "sleep", lambda seconds: None)
+    state = tmp_path / "checkpoint.json"
+
+    first = sitemaps.sitemap_search(GRAPH_ROOT, checkpoint_path=str(state), per_run_budget=1)
+    second = sitemaps.sitemap_search(GRAPH_ROOT, checkpoint_path=str(state), per_run_budget=1)
+    assert SitemapCheckpoint.load(state).completed is True
+    assert sorted(set(first) | set(second)) == [page]
+    assert requested.count(nested) == 1
+
+
+def test_checkpoint_corrupt_state_aborts_before_requests(monkeypatch, tmp_path):
+    """A corrupt checkpoint raises and the network is never touched."""
+    state = tmp_path / "checkpoint.json"
+    state.write_text("{broken", encoding="utf-8")
+
+    def fail_if_called(*args, **kwargs):
+        pytest.fail("no request must be sent with a corrupt checkpoint")
+
+    monkeypatch.setattr(sitemaps, "fetch_url", fail_if_called)
+    monkeypatch.setattr(sitemaps, "is_live_page", fail_if_called)
+    with pytest.raises(CheckpointFormatError):
+        sitemaps.sitemap_search(GRAPH_ROOT, checkpoint_path=str(state))
+    # the corrupt file is not overwritten
+    assert state.read_text(encoding="utf-8") == "{broken"
+
+
+def test_checkpoint_policy_mismatch_aborts_before_requests(monkeypatch, tmp_path):
+    """Entry, language or external-link mismatch raises before any request."""
+    state = tmp_path / "checkpoint.json"
+    SitemapCheckpoint.open(state, GRAPH_ROOT, target_lang="de").save()
+
+    def fail_if_called(*args, **kwargs):
+        pytest.fail("no request must be sent on a policy mismatch")
+
+    monkeypatch.setattr(sitemaps, "fetch_url", fail_if_called)
+    monkeypatch.setattr(sitemaps, "is_live_page", fail_if_called)
+    with pytest.raises(CheckpointMismatchError):
+        sitemaps.sitemap_search(GRAPH_ROOT, target_lang="en", checkpoint_path=str(state))
+    with pytest.raises(CheckpointMismatchError):
+        sitemaps.sitemap_search("https://example.org/other.xml", checkpoint_path=str(state))
+    # the original state is untouched
+    assert SitemapCheckpoint.load(state).target_lang == "de"
+
+
+def test_checkpoint_write_failure_keeps_last_good_state(monkeypatch, tmp_path):
+    """If a state write fails mid-run, the previous valid file remains usable."""
+    _patch_graph(monkeypatch)
+    state = tmp_path / "checkpoint.json"
+    # first run writes a valid state
+    sitemaps.sitemap_search(GRAPH_ROOT, checkpoint_path=str(state), per_run_budget=1)
+    good_content = state.read_text(encoding="utf-8")
+
+    real_replace = os.replace
+
+    def fail_replace(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(CheckpointFormatError):
+        sitemaps.sitemap_search(GRAPH_ROOT, checkpoint_path=str(state), per_run_budget=1)
+
+    # last good state is intact, no temp file lingers and resumption still works
+    assert state.read_text(encoding="utf-8") == good_content
+    assert not list(tmp_path.glob("*.tmp"))
+    monkeypatch.setattr(os, "replace", real_replace)
+    result = sitemaps.sitemap_search(GRAPH_ROOT, checkpoint_path=str(state))
+    assert result == GRAPH_EXPECTED
+
+
+def test_checkpoint_without_flag_keeps_one_shot_behavior(monkeypatch, tmp_path):
+    """Without checkpoint arguments, no state file is created and output is unchanged."""
+    requested = _patch_graph(monkeypatch)
+    state = tmp_path / "checkpoint.json"
+    result = sitemaps.sitemap_search(GRAPH_ROOT)
+    assert result == GRAPH_EXPECTED
+    assert not state.exists()
+    # plain run still requests each sitemap once
+    assert len(requested) == len(set(requested))
+
+
+def test_checkpoint_respects_max_sitemaps_cap(monkeypatch, tmp_path):
+    """The absolute max_sitemaps cap terminates the traversal as completed."""
+    _patch_graph(monkeypatch)
+    state = tmp_path / "checkpoint.json"
+    for _ in range(5):
+        sitemaps.sitemap_search(GRAPH_ROOT, checkpoint_path=str(state), per_run_budget=1, max_sitemaps=2)
+    checkpoint = SitemapCheckpoint.load(state)
+    assert checkpoint.completed is True
+    assert len(checkpoint.seen) == 2
+
+
+def test_checkpoint_guess_frontier_resumes(monkeypatch, tmp_path):
+    """Fallback guesses discovered in one process are not re-guessed after a restart."""
+    base = "https://example.org"
+    pages = {
+        f"{base}/sitemap.xml": None,
+        f"{base}/sitemap.xml.gz": "<urlset><url><loc>https://example.org/gz</loc></url></urlset>",
+    }
+    requested = []
+
+    def fetch(url, **kwargs):
+        requested.append(url)
+        return pages.get(url)
+
+    monkeypatch.setattr(sitemaps, "find_robots_sitemaps", lambda url, config: [])
+    monkeypatch.setattr(sitemaps, "fetch_url", fetch)
+    monkeypatch.setattr(sitemaps, "is_live_page", lambda url, config: True)
+    monkeypatch.setattr(sitemaps, "sleep", lambda seconds: None)
+    state = tmp_path / "checkpoint.json"
+
+    for _ in range(6):
+        sitemaps.sitemap_search(f"{base}/", checkpoint_path=str(state), per_run_budget=1)
+        if SitemapCheckpoint.load(state).completed:
+            break
+
+    checkpoint = SitemapCheckpoint.load(state)
+    assert checkpoint.completed is True
+    assert f"{base}/sitemap.xml" in checkpoint.seen
+    assert f"{base}/sitemap.xml.gz" in checkpoint.seen
+    assert requested.count(f"{base}/sitemap.xml") == 1
+    assert requested.count(f"{base}/sitemap.xml.gz") == 1
+
+
+def test_checkpoint_segmented_matches_one_shot_with_language_filter(monkeypatch, tmp_path):
+    """A target_lang filter gives the same result across segments as one full run."""
+    pages = _graph_pages()
+    pages[GRAPH_NESTED[0]] = (
+        "<urlset><url><loc>https://example.org/en/a1</loc></url><url><loc>https://example.org/de/a2</loc></url></urlset>"
+    )
+    requested = []
+
+    def fetch(url, **kwargs):
+        requested.append(url)
+        return pages.get(url)
+
+    monkeypatch.setattr(sitemaps, "fetch_url", fetch)
+    monkeypatch.setattr(sitemaps, "is_live_page", lambda url, config: True)
+    monkeypatch.setattr(sitemaps, "sleep", lambda seconds: None)
+    state = tmp_path / "checkpoint.json"
+
+    segmented = set()
+    for _ in range(6):
+        segmented |= set(sitemaps.sitemap_search(GRAPH_ROOT, target_lang="en", checkpoint_path=str(state), per_run_budget=1))
+        if SitemapCheckpoint.load(state).completed:
+            break
+
+    one_shot = sitemaps.sitemap_search(GRAPH_ROOT, target_lang="en")
+    assert sorted(segmented) == one_shot
+    # the German-only link is filtered out, identically in both executions
+    assert "https://example.org/de/a2" not in segmented
+    assert "https://example.org/de/a2" not in one_shot
+
+
+def test_checkpoint_segmented_matches_one_shot_with_external_links(monkeypatch, tmp_path):
+    """external=True keeps external links identically across segments."""
+    pages = _graph_pages()
+    pages[GRAPH_NESTED[2]] = (
+        "<urlset><url><loc>https://example.org/c1</loc></url><url><loc>https://other-domain.net/x</loc></url></urlset>"
+    )
+    monkeypatch.setattr(sitemaps, "fetch_url", lambda url, **kwargs: pages.get(url))
+    monkeypatch.setattr(sitemaps, "is_live_page", lambda url, config: True)
+    monkeypatch.setattr(sitemaps, "sleep", lambda seconds: None)
+    state = tmp_path / "checkpoint.json"
+
+    segmented = set()
+    for _ in range(6):
+        segmented |= set(sitemaps.sitemap_search(GRAPH_ROOT, external=True, checkpoint_path=str(state), per_run_budget=1))
+        if SitemapCheckpoint.load(state).completed:
+            break
+
+    one_shot = sitemaps.sitemap_search(GRAPH_ROOT, external=True)
+    assert sorted(segmented) == one_shot
+    assert "https://other-domain.net/x" in segmented
+
+
+def test_checkpoint_subpage_filter_accumulates_only_matching_links(monkeypatch, tmp_path):
+    """The subpage URL filter applies to the cumulative set on every save."""
+    # a non-sitemap entry under /blog activates the subpage URL filter
+    entry = "https://example.org/blog"
+    root = "https://example.org/sitemap.xml"
+    nested = "https://example.org/part.xml"
+    pages = {
+        "https://example.org/robots.txt": f"Sitemap: {root}\n",
+        root: f"<sitemapindex><sitemap><loc>{nested}</loc></sitemap></sitemapindex>",
+        nested: (
+            "<urlset>"
+            "<url><loc>https://example.org/blog/post-1</loc></url>"
+            "<url><loc>https://example.org/news/post-2</loc></url>"
+            "</urlset>"
+        ),
+    }
+    monkeypatch.setattr(sitemaps, "fetch_url", lambda url, **kwargs: pages.get(url))
+    monkeypatch.setattr(sitemaps, "is_live_page", lambda url, config: True)
+    monkeypatch.setattr(sitemaps, "sleep", lambda seconds: None)
+    state = tmp_path / "checkpoint.json"
+
+    segmented = set()
+    for _ in range(6):
+        segmented |= set(sitemaps.sitemap_search(entry, checkpoint_path=str(state), per_run_budget=1))
+        if SitemapCheckpoint.load(state).completed:
+            break
+
+    one_shot = sitemaps.sitemap_search(entry)
+    checkpoint = SitemapCheckpoint.load(state)
+    assert checkpoint.completed is True
+    assert one_shot == ["https://example.org/blog/post-1"]
+    assert sorted(segmented) == one_shot
+    assert checkpoint.urls == ["https://example.org/blog/post-1"]

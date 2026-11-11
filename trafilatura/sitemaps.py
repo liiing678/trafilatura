@@ -4,9 +4,10 @@ Deriving link info from sitemaps.
 
 import logging
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from configparser import ConfigParser
 from itertools import islice
+from pathlib import Path
 from re import Pattern
 from time import sleep
 from urllib.parse import urlsplit
@@ -20,6 +21,7 @@ from courlan import (
 )
 from lxml import etree
 
+from .checkpoint import SitemapCheckpoint
 from .deduplication import is_similar_domain
 from .downloads import fetch_url, is_live_page
 from .settings import DEFAULT_CONFIG, MAX_LINKS, MAX_SITEMAPS_SEEN
@@ -258,6 +260,9 @@ def sitemap_search(
     sleep_time: float | None = None,
     max_sitemaps: int = MAX_SITEMAPS_SEEN,
     config: ConfigParser = DEFAULT_CONFIG,
+    *,
+    checkpoint_path: str | Path | None = None,
+    per_run_budget: int | None = None,
 ) -> list[str]:
     """Look for sitemaps for the given URL and gather links.
 
@@ -272,11 +277,32 @@ def sitemap_search(
                     (defaults to SLEEP_TIME in the config).
         max_sitemaps: Maximum number of sitemaps to process.
         config: Pass configuration values for download control.
+        checkpoint_path: If given, progress is persisted to this JSON file and
+            the search is resumable across processes. Already submitted
+            sitemaps are not requested again on resume.
+        per_run_budget: Maximum number of new sitemaps processed in this call
+            when ``checkpoint_path`` is set. ``None`` means process everything
+            that remains. Requires ``checkpoint_path`` and must be positive.
 
     Returns:
-        The extracted links as a list (sorted list of unique links).
+        The extracted links as a list (sorted list of unique links). With a
+        checkpoint, this is the cumulative link set found so far; call
+        :meth:`~trafilatura.checkpoint.SitemapCheckpoint.open` again to tell a
+        finished search from a budget-limited, resumable one.
+
+    Raises:
+        ValueError: Invalid ``per_run_budget`` or a budget without a checkpoint.
+        CheckpointError: The checkpoint file is corrupt, unwritable or was
+            created for another entry URL or link policy. No request is sent
+            and no valid state is overwritten in that case.
 
     """
+    if per_run_budget is not None:
+        if checkpoint_path is None:
+            raise ValueError("per_run_budget requires checkpoint_path")
+        if per_run_budget < 1:
+            raise ValueError("per_run_budget must be a positive integer")
+
     domainname, baseurl = get_hostinfo(url)
     if domainname is None:
         LOGGER.warning("invalid URL: %s", url)
@@ -284,6 +310,15 @@ def sitemap_search(
 
     if sleep_time is None:
         sleep_time = config.getfloat("DEFAULT", "SLEEP_TIME")
+
+    checkpoint: SitemapCheckpoint | None = None
+    if checkpoint_path is not None:
+        # validate the local state before any network activity: a corrupt or
+        # mismatching checkpoint must raise without sending a request
+        checkpoint = SitemapCheckpoint.open(checkpoint_path, url, target_lang, external)
+        if checkpoint.completed:
+            LOGGER.debug("checkpoint already completed for %s", url)
+            return list(checkpoint.urls)
 
     if not is_live_page(baseurl, config):
         LOGGER.warning("base URL unreachable, dropping sitemap: %s", url)
@@ -314,20 +349,59 @@ def sitemap_search(
     # A sitemap can use a different scheme or www. form of the same host.
     prefix = SCHEME_AND_WWW.sub("", urlfilter) if urlfilter is not None else None
     # Guesses are fallbacks, while listed and discovered sitemaps are all followed.
-    guesses: Iterator[str] = iter(())
-    if not sitemap.sitemap_urls:
+    robots_checked = False
+    guesses: list[str] = []
+    if checkpoint is not None:
+        # resume from the persisted frontier
+        sitemap.seen = set(checkpoint.seen)
+        sitemap.sitemap_urls = list(checkpoint.queue)
+        sitemap.urls = list(checkpoint.urls)
+        guesses = list(checkpoint.guesses)
+        robots_checked = checkpoint.robots_checked
+        # a kill before the first discovery decision was persisted: redo it
+        if not robots_checked and not sitemap.sitemap_urls and not guesses:
+            sitemap.sitemap_urls = find_robots_sitemaps(baseurl, config)
+            robots_checked = True
+            if not sitemap.sitemap_urls:
+                guesses = [f"{baseurl}/{guess}" for guess in GUESSES]
+            checkpoint.record("", sitemap.seen, sitemap.sitemap_urls, guesses, robots_checked, [])
+            checkpoint.save()
+    elif not sitemap.sitemap_urls:
         sitemap.sitemap_urls = find_robots_sitemaps(baseurl, config)
+        robots_checked = True
         if not sitemap.sitemap_urls:
-            guesses = (f"{baseurl}/{guess}" for guess in GUESSES)
+            guesses = [f"{baseurl}/{guess}" for guess in GUESSES]
 
+    # first fallback guess not considered yet; the list itself is the persisted frontier
+    guess_index = 0
+    processed_this_run = 0
     while len(sitemap.seen) < max_sitemaps:
+        if checkpoint is not None and per_run_budget is not None and processed_this_run >= per_run_budget:
+            # budget spent: persist the current frontier so nothing is redone
+            checkpoint.record(
+                sitemap.current_url,
+                sitemap.seen,
+                sitemap.sitemap_urls,
+                guesses[guess_index:],
+                robots_checked,
+                _checkpoint_urls(sitemap, prefix),
+            )
+            checkpoint.save()
+            break
         if sitemap.sitemap_urls:
             sitemap.current_url = sitemap.sitemap_urls.pop()
         else:
-            next_guess = next((guess for guess in guesses if guess not in sitemap.seen), None)
+            while guess_index < len(guesses) and guesses[guess_index] in sitemap.seen:
+                guess_index += 1
+            next_guess = guesses[guess_index] if guess_index < len(guesses) else None
             if next_guess is None or any(prefix is None or SCHEME_AND_WWW.sub("", u).startswith(prefix) for u in sitemap.urls):
+                # once a matching link is found, the remaining fallbacks are never tried
+                if next_guess is not None:
+                    guesses = []
+                    guess_index = 0
                 break
             sitemap.current_url = next_guess
+            guess_index += 1
 
         if sitemap.seen:
             sleep(sleep_time)
@@ -335,13 +409,51 @@ def sitemap_search(
         sitemap.process()
         # sanity check: keep track of visited sitemaps and exclude them
         sitemap.sitemap_urls = [s for s in sitemap.sitemap_urls if s not in sitemap.seen]
+        processed_this_run += 1
+
+        if checkpoint is not None:
+            # the state is only replaced once this sitemap is fully handled;
+            # the in-flight URL stays recoverable through `seen`/`guesses`
+            checkpoint.record(
+                sitemap.current_url,
+                sitemap.seen,
+                sitemap.sitemap_urls,
+                guesses[guess_index:],
+                robots_checked,
+                _checkpoint_urls(sitemap, prefix),
+            )
+            checkpoint.save()
+    else:
+        # the max_sitemaps cap was reached: nothing else can ever be processed
+        if checkpoint is not None:
+            checkpoint.mark_completed(_checkpoint_urls(sitemap, prefix))
+            checkpoint.save()
+            return list(checkpoint.urls)
 
     if prefix is not None:
         sitemap.urls = [u for u in sitemap.urls if SCHEME_AND_WWW.sub("", u).startswith(prefix)]
     sitemap.urls = filter_urls(sitemap.urls, None)
 
+    if checkpoint is not None:
+        # no work left in either frontier: the traversal is finished
+        if not sitemap.sitemap_urls and guess_index >= len(guesses):
+            checkpoint.mark_completed(sitemap.urls)
+            checkpoint.save()
+        else:
+            # keep the persisted link set in sync with the returned one
+            checkpoint.urls = list(sitemap.urls)
+            checkpoint.save()
+
     LOGGER.debug("%s sitemap links found for %s", len(sitemap.urls), domainname)
     return sitemap.urls
+
+
+def _checkpoint_urls(sitemap: SitemapObject, prefix: str | None) -> list[str]:
+    "Sorted unique links found so far, with the subpage filter already applied."
+    urls = sitemap.urls
+    if prefix is not None:
+        urls = [u for u in urls if SCHEME_AND_WWW.sub("", u).startswith(prefix)]
+    return filter_urls(urls, None)
 
 
 def is_plausible_sitemap(url: str, contents: str | None) -> bool:

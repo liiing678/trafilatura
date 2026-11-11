@@ -135,6 +135,17 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
     )
     group3.add_argument(
+        "--checkpoint",
+        help="resumable --sitemap --list: persist progress to this JSON state file and resume from it",
+        type=str,
+    )
+    group3.add_argument(
+        "--sitemap-budget",
+        help="with --checkpoint, process at most N new sitemaps in this run and exit for later resumption",
+        type=int,
+        metavar="N",
+    )
+    group3.add_argument(
         "--url-filter",
         help="only process input URLs containing these patterns (space-separated strings)",
         nargs="+",
@@ -238,6 +249,23 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             parser.error(f"--config-file: {err}")
     if args.parallel < 1:
         parser.error("--parallel must be a positive integer")
+    if args.checkpoint or args.sitemap_budget is not None:
+        if not args.sitemap or not args.list:
+            parser.error("--checkpoint and --sitemap-budget require --sitemap --list")
+        if args.sitemap_budget is not None and not args.checkpoint:
+            parser.error("--sitemap-budget requires --checkpoint")
+        if args.input_file or args.input_dir or not args.URL:
+            parser.error("--checkpoint and --sitemap-budget require a single URL given with --sitemap or -u/--URL")
+        if args.sitemap_budget is not None and args.sitemap_budget < 1:
+            parser.error("--sitemap-budget must be a positive integer")
+        if args.checkpoint:
+            checkpoint_path = Path(args.checkpoint)
+            if checkpoint_path.exists():
+                if checkpoint_path.is_dir() or not os.access(args.checkpoint, os.R_OK):
+                    parser.error(f"--checkpoint: not a readable file: {args.checkpoint}")
+            elif not os.access(checkpoint_path.parent or ".", os.W_OK):
+                parent = checkpoint_path.parent or "."
+                parser.error(f"--checkpoint: directory not writable: {parent}")
     if args.name_from_url:
         if not args.output_dir:
             parser.error("--name-from-url requires an output directory (-o/--output-dir)")

@@ -37,6 +37,7 @@ from courlan import UrlStore, get_base_url  # validate_url
 from trafilatura import spider
 
 from .baseline import html2txt
+from .checkpoint import CheckpointError, SitemapCheckpoint
 from .core import extract
 from .deduplication import generate_bow_hash
 from .downloads import (
@@ -326,8 +327,58 @@ def download_queue_processing(
     return errors, counter
 
 
+def cli_sitemap_checkpoint(args: argparse.Namespace) -> int:
+    """Resumable ``--sitemap --list`` backed by an on-disk checkpoint.
+
+    Each run prints the links newly discovered since the previous one; the run
+    that finishes the traversal prints the whole cumulative, de-duplicated set.
+    Returns 3 when the per-run budget is spent while work remains.
+    """
+    url = args.URL
+    options = args_to_extractor(args)
+    try:
+        # read-only look at the previous state: no request must be sent first
+        previous = SitemapCheckpoint.load(args.checkpoint) if Path(args.checkpoint).exists() else None
+        previous_urls = set(previous.urls) if previous is not None else set()
+        links = sitemap_search(
+            url,
+            target_lang=args.target_language,
+            external=options.config.getboolean("DEFAULT", "EXTERNAL_URLS"),
+            sleep_time=options.config.getfloat("DEFAULT", "SLEEP_TIME"),
+            config=options.config,
+            checkpoint_path=args.checkpoint,
+            per_run_budget=args.sitemap_budget,
+        )
+        state = SitemapCheckpoint.load(args.checkpoint)
+    except CheckpointError as err:
+        sys.stderr.write(f"ERROR: {err}\n")
+        return 2
+
+    links = filter_blacklist(links, args.blacklist)
+    if state.completed:
+        # final export: the cumulative de-duplicated set, equal to one full run
+        for link in links:
+            print(link)
+    else:
+        # incremental output: only what this run added to the checkpoint
+        for link in links:
+            if link not in previous_urls:
+                print(link)
+        LOGGER.info(
+            "checkpoint: %s sitemaps processed, %s links accumulated, resume with the same command",
+            state.processed_count,
+            len(state.urls),
+        )
+        return 3
+    return 0
+
+
 def cli_discovery(args: argparse.Namespace) -> int:
     "Group CLI functions dedicated to URL discovery."
+    # resumable, single-entry sitemap listing with an on-disk checkpoint
+    if getattr(args, "checkpoint", None):
+        return cli_sitemap_checkpoint(args)
+
     url_store = load_input_dict(args)
     input_urls = url_store.dump_urls()
     if not input_urls:

@@ -526,6 +526,35 @@ Pass your HTTP client's decoded response text or a cached sitemap to ``parse_sit
 
 The result contains sorted unique links. For a sitemap index, these are nested sitemap addresses. Fetch and parse those separately with your own HTTP client. The ``target_lang`` and ``external`` options apply the existing link filters.
 
+Resumable searches
+~~~~~~~~~~~~~~~~~~
+
+Large sites may span thousands of nested sitemaps. Pass ``checkpoint_path`` to persist progress to a JSON state file and split the traversal into several processes or invocations. Already submitted sitemaps are skipped on resume, and the links accumulated so far are stored in the file.
+
+.. code-block:: python
+
+    from trafilatura import sitemaps
+
+    state_file = "sitemap-state.json"
+    # process at most 100 new sitemaps in this run, then stop
+    links = sitemaps.sitemap_search(
+        "https://example.org/sitemap.xml",
+        checkpoint_path=state_file,
+        per_run_budget=100,
+    )
+
+Re-running the same call resumes from the saved frontier. Without ``per_run_budget`` the remaining sitemaps are all processed and the traversal is marked complete. The cumulative, de-duplicated link set then equals what a single uninterrupted run would return; a completed checkpoint returns the final links without making new requests.
+
+The state records the entry URL together with the ``target_lang`` and ``external`` policy. Opening it with another entry or another policy raises a :class:`~trafilatura.checkpoint.CheckpointMismatchError`; an unreadable or corrupt file raises a :class:`~trafilatura.checkpoint.CheckpointFormatError`. In both cases no request is sent and the existing file is left untouched. Writes are atomic, so a failed write or a process killed mid-run can at worst leave the previous valid state in place.
+
+.. code-block:: python
+
+    from trafilatura.checkpoint import SitemapCheckpoint
+
+    # inspect whether the traversal has finished without fetching anything
+    state = SitemapCheckpoint.load("sitemap-state.json")
+    print(state.completed, state.processed_count, len(state.urls))
+
 
 Web crawling
 ^^^^^^^^^^^^

@@ -292,6 +292,24 @@ Sitemaps
     $ trafilatura --sitemap "https://www.sitemaps.org/" --list --target-language "de"
 
 
+For very large sites, ``--checkpoint`` stores the discovery progress in a JSON state file so the search can be split across several invocations. Combined with ``--sitemap-budget N``, each run processes at most *N* new sitemaps and exits; repeating the same command resumes where the previous one stopped without re-requesting already processed sitemaps. A single entry URL is required (no input file or input directory).
+
+.. code-block:: bash
+
+    # process up to 50 new sitemaps, then stop; progress is kept in state.json
+    $ trafilatura --sitemap "https://www.example.org/sitemap.xml" --list \
+        --checkpoint state.json --sitemap-budget 50
+
+    # repeat the same command as often as needed until the whole site is covered
+    $ trafilatura --sitemap "https://www.example.org/sitemap.xml" --list \
+        --checkpoint state.json --sitemap-budget 50
+
+    # finish everything left in one run (drop the budget), or re-export the links
+    $ trafilatura --sitemap "https://www.example.org/sitemap.xml" --list \
+        --checkpoint state.json
+
+Each budget-limited run prints the links it newly discovered; the final run exports the whole cumulative, de-duplicated link set, identical to what a single uninterrupted traversal returns. The state file records the entry URL and the language/external-link policy: resuming with a different entry or policy, or pointing ``--checkpoint`` at a corrupt file, exits with an error before any request is sent and leaves the existing state untouched.
+
 For more information on sitemap use and filters for lists of links see this blog post: `Using sitemaps to crawl websites <https://adrien.barbaresi.eu/blog/using-sitemaps-crawl-websites.html>`_.
 
 
@@ -335,10 +353,11 @@ For more information on sitemap use and filters for lists of links see this blog
 Exit codes
 ----------
 
-- ``0``: success, including inputs without extractable content and local files or STDIN input rejected for their size.
+- ``0``: success, including inputs without extractable content and local files or STDIN input rejected for their size. A resumable ``--sitemap --list`` run also exits 0 when the traversal is finished and the full link set is exported.
 - ``1``: some inputs could not be downloaded or read (downloads rejected for their size count as failed), ``--feed`` or ``--sitemap`` found no links for some of them, no valid input URL is left (also for an empty input list), or the output directory cannot be written.
 - ``126``: more than 99% of the inputs could not be downloaded (also when ``--crawl``, ``--probe`` or ``--explore`` cannot fetch the start pages).
-- ``2``: invalid arguments, for example a missing input file, ``--parallel 0``, or ``--feed`` without a URL.
+- ``2``: invalid arguments, for example a missing input file, ``--parallel 0``, or ``--feed`` without a URL. This also covers a ``--checkpoint`` file that is corrupt or whose entry URL or language/external-link policy does not match the current run; no request is sent and the state file is left untouched.
+- ``3``: a resumable ``--sitemap --list`` run spent its ``--sitemap-budget`` while sitemaps remain to process. Re-run the same command to resume; this is an expected pause, not an error.
 
 
 Deprecations
